@@ -22,8 +22,22 @@
 #include "dawn/SIR/ASTVisitor.h"
 #include "dawn/SIR/SIR.h"
 #include "dawn/Serialization/ASTSerializer.h"
+#include "dawn/IIR/Interval.h"
 #include <fstream>
 #include <google/protobuf/util/json_util.h>
+
+#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/StandardTypes.h"
+#include "mlir/StandardOps/Ops.h"
+#include "mlir/Stencil/StencilOps.h"
+#include "mlir/Stencil/StencilTypes.h"
+#include "mlir/Parser.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/SMLoc.h"
+
+static mlir::DialectRegistration<mlir::Stencil::StencilDialect> stencilOps;
 
 namespace dawn {
 static void setAccesses(proto::iir::Accesses* protoAccesses,
@@ -69,17 +83,67 @@ static iir::Extents makeExtents(const proto::iir::Extents* protoExtents) {
 
 static void
 serializeStmtAccessPair(proto::iir::StatementAccessPair* protoStmtAccessPair,
-                        const std::unique_ptr<iir::StatementAccessesPair>& stmtAccessPair) {
+                        const std::unique_ptr<iir::StatementAccessesPair>& stmtAccessPair,
+						mlir::OpBuilder& mlirBuilder, const std::map<int, int> &idsToValues,
+						const iir::StencilMetaInformation &metadata) {
+	auto mlirStmtAccessPair = mlirBuilder.create<mlir::Stencil::StmtAccessPairOp>(mlirBuilder.getUnknownLoc());
+	mlirStmtAccessPair.body().push_back(new mlir::Block());
+	mlir::OpBuilder stmtBuilder(mlirStmtAccessPair.body());
+
   // serialize the statement
   ProtoStmtBuilder builder(protoStmtAccessPair->mutable_aststmt());
   stmtAccessPair->getStatement()->ASTStmt->accept(builder);
 
+  MLIRStmtBuilder mlirStmtBuilder(stmtBuilder, idsToValues, metadata);
+  stmtAccessPair->getStatement()->ASTStmt->acceptAndReplace(mlirStmtBuilder);
+
   // check if caller accesses are initialized, and if so, fill them
-  if(stmtAccessPair->getCallerAccesses()) {
-    setAccesses(protoStmtAccessPair->mutable_accesses(), stmtAccessPair->getCallerAccesses());
+  auto accesses = stmtAccessPair->getCallerAccesses();
+  if(accesses) {
+	llvm::SmallVector<mlir::Attribute, 3> readAccesses;
+	for(auto &readAccess : accesses->getReadAccesses()) {
+		int64_t fieldID = readAccess.first;
+		iir::Extents extents = readAccess.second;
+
+		int64_t iMinus = extents[0].Minus;
+		int64_t iPlus = extents[0].Plus;
+		int64_t jMinus = extents[1].Minus;
+		int64_t jPlus = extents[1].Plus;
+		int64_t kMinus = extents[2].Minus;
+		int64_t kPlus = extents[2].Plus;
+
+		mlir::ArrayAttr readAccessAttr = stmtBuilder.getI64ArrayAttr({
+			fieldID, iMinus, iPlus, jMinus, jPlus, kMinus, kPlus
+		});
+		readAccesses.push_back(readAccessAttr);
+	}
+	mlirStmtAccessPair.setAttr("read_accesses", stmtBuilder.getArrayAttr(readAccesses));
+
+	llvm::SmallVector<mlir::Attribute, 3> writeAccesses;
+	for(auto &writeAccess : accesses->getWriteAccesses()) {
+		int64_t fieldID = writeAccess.first;
+		iir::Extents extents = writeAccess.second;
+
+		int64_t iMinus = extents[0].Minus;
+		int64_t iPlus = extents[0].Plus;
+		int64_t jMinus = extents[1].Minus;
+		int64_t jPlus = extents[1].Plus;
+		int64_t kMinus = extents[2].Minus;
+		int64_t kPlus = extents[2].Plus;
+
+		mlir::ArrayAttr writeAccessAttr = stmtBuilder.getI64ArrayAttr({
+			fieldID, iMinus, iPlus, jMinus, jPlus, kMinus, kPlus
+		});
+		writeAccesses.push_back(writeAccessAttr);
+	}
+	mlirStmtAccessPair.setAttr("write_accesses", stmtBuilder.getArrayAttr(writeAccesses));
+
+    setAccesses(protoStmtAccessPair->mutable_accesses(), accesses);
   }
   DAWN_ASSERT_MSG(!stmtAccessPair->getCalleeAccesses(),
-                  "inlining did not work as we have calee-accesses");
+                  "inlining did not work as we have callee-accesses");
+
+  stmtBuilder.create<mlir::Stencil::TerminatorOp>(stmtBuilder.getUnknownLoc());
 }
 
 static void setCache(proto::iir::Cache* protoCache, const iir::Cache& cache) {
@@ -307,7 +371,11 @@ void IIRSerializer::serializeMetaData(proto::iir::StencilInstantiation& target,
 }
 
 void IIRSerializer::serializeIIR(proto::iir::StencilInstantiation& target,
-                                 const std::unique_ptr<iir::IIR>& iir) {
+                                 const std::unique_ptr<iir::IIR>& iir,
+								 const iir::StencilMetaInformation& metadata) {
+  mlir::MLIRContext context;
+  mlir::Module module = mlir::Module::create(&context);
+
   auto protoIIR = target.mutable_internalir();
 
   auto& protoGlobalVariableMap = *protoIIR->mutable_globalvariabletovalue();
@@ -351,6 +419,35 @@ void IIRSerializer::serializeIIR(proto::iir::StencilInstantiation& target,
 
   // Get all the stencils
   for(const auto& stencils : iir->getChildren()) {
+    auto apiFields = stencils->getMetadata().getFieldAccessMetadata().apiFieldIDs_;
+    llvm::SmallVector<mlir::Type, 3> argumentTypes;
+	llvm::SmallVector<mlir::NamedAttributeList, 3> argumentAttributes;
+    std::map<int, int> idsToArguments;
+    int argumentIndex = 0;
+    for(const auto& field : apiFields) {
+		idsToArguments[field] = argumentIndex++;
+		mlir::Type f64 = mlir::FloatType::getF64(&context);
+	  mlir::Type fieldType = mlir::Stencil::StencilFieldType::get(&context, f64, true, true, true);
+      argumentTypes.push_back(fieldType);
+    }
+
+    mlir::FunctionType mlirStencilType =
+        mlir::FunctionType::get(argumentTypes, llvm::None, &context);
+    mlir::Function mlirStencil = mlir::Function::create(
+        mlir::UnknownLoc::get(&context), stencils->getMetadata().getStencilName(), mlirStencilType);
+
+	mlirStencil.addEntryBlock();
+	mlir::OpBuilder builder(mlirStencil.getBody());
+
+	mlirStencil.setAttr("stencil.stencil", builder.getUnitAttr());
+	mlirStencil.setAttr("stencil.id", builder.getI64IntegerAttr(stencils->getStencilID()));
+
+	for(const auto& field : apiFields) {
+		std::string fieldName = stencils->getMetadata().getFieldNameFromAccessID(field);
+		mlirStencil.setArgAttr(idsToArguments[field], "stencil.id", builder.getI64IntegerAttr(field));
+		mlirStencil.setArgAttr(idsToArguments[field], "stencil.name", builder.getStringAttr(fieldName));
+	}
+
     // creation of a new protobuf stencil
     auto protoStencil = protoIIR->add_stencils();
     // Information other than the children
@@ -359,36 +456,54 @@ void IIRSerializer::serializeIIR(proto::iir::StencilInstantiation& target,
     if(stencils->getStencilAttributes().has(sir::Attr::AK_MergeDoMethods)) {
       protoAttribute->add_attributes(
           proto::iir::Attributes::StencilAttributes::Attributes_StencilAttributes_MergeDoMethods);
+	  mlirStencil.setAttr("stencil.merge_do_methods", mlir::UnitAttr::get(&context));
     }
     if(stencils->getStencilAttributes().has(sir::Attr::AK_MergeStages)) {
       protoAttribute->add_attributes(
           proto::iir::Attributes::StencilAttributes::Attributes_StencilAttributes_MergeStages);
+	  mlirStencil.setAttr("stencil.merge_stages", mlir::UnitAttr::get(&context));
     }
     if(stencils->getStencilAttributes().has(sir::Attr::AK_MergeTemporaries)) {
       protoAttribute->add_attributes(
           proto::iir::Attributes::StencilAttributes::Attributes_StencilAttributes_MergeTemporaries);
+	  mlirStencil.setAttr("stencil.merge_temporaries", mlir::UnitAttr::get(&context));
     }
     if(stencils->getStencilAttributes().has(sir::Attr::AK_NoCodeGen)) {
       protoAttribute->add_attributes(
           proto::iir::Attributes::StencilAttributes::Attributes_StencilAttributes_NoCodeGen);
+	  mlirStencil.setAttr("stencil.no_codegen", mlir::UnitAttr::get(&context));
     }
     if(stencils->getStencilAttributes().has(sir::Attr::AK_UseKCaches)) {
       protoAttribute->add_attributes(
           proto::iir::Attributes::StencilAttributes::Attributes_StencilAttributes_UseKCaches);
+	  mlirStencil.setAttr("stencil.use_kcaches", mlir::UnitAttr::get(&context));
     }
 
     // adding it's children
     for(const auto& multistages : stencils->getChildren()) {
       // creation of a protobuf multistage
       auto protoMSS = protoStencil->add_multistages();
+
+	  std::string loopOrder;
+
       // Information other than the children
       if(multistages->getLoopOrder() == dawn::iir::LoopOrderKind::LK_Forward) {
+		  loopOrder = "Forward";
         protoMSS->set_looporder(proto::iir::MultiStage::Forward);
       } else if(multistages->getLoopOrder() == dawn::iir::LoopOrderKind::LK_Backward) {
+		  loopOrder = "Backward";
         protoMSS->set_looporder(proto::iir::MultiStage::Backward);
       } else {
+		  loopOrder = "Parallel";
         protoMSS->set_looporder(proto::iir::MultiStage::Parallel);
       }
+
+      auto mlirMultiStage = builder.create<mlir::Stencil::MultiStageOp>(builder.getUnknownLoc(), builder.getStringAttr(loopOrder));
+	  mlirMultiStage.body().push_back(new mlir::Block());
+	  mlir::OpBuilder multiStageBuilder(mlirMultiStage.body());
+
+	  mlirMultiStage.setAttr("id", builder.getI64IntegerAttr(multistages->getID()));
+
       protoMSS->set_multistageid(multistages->getID());
       auto& protoMSSCacheMap = *protoMSS->mutable_caches();
       for(const auto& IDCachePair : multistages->getCaches()) {
@@ -402,6 +517,12 @@ void IIRSerializer::serializeIIR(proto::iir::StencilInstantiation& target,
         // Information other than the children
         protoStage->set_stageid(stages->getStageID());
 
+		auto mlirStage = multiStageBuilder.create<mlir::Stencil::StageOp>(multiStageBuilder.getUnknownLoc());
+		mlirStage.body().push_back(new mlir::Block());
+		mlir::OpBuilder stageBuilder(mlirStage.body());
+
+		mlirStage.setAttr("id", multiStageBuilder.getI64IntegerAttr(stages->getStageID()));
+
         // adding it's children
         for(const auto& domethod : stages->getChildren()) {
           auto protoDoMethod = protoStage->add_domethods();
@@ -410,14 +531,36 @@ void IIRSerializer::serializeIIR(proto::iir::StencilInstantiation& target,
           setInterval(protoDoMethod->mutable_interval(), &interval);
           protoDoMethod->set_domethodid(domethod->getID());
 
+		  std::string lower = interval.LowerLevel == 0 ? "kstart" :
+								interval.LowerLevel == (1 << 20) ? "kend" : "undefined";
+		  std::string upper = interval.UpperLevel == 0 ? "kstart" :
+								interval.UpperLevel == (1 << 20) ? "kend" : "undefined";
+		  auto mlirDo = stageBuilder.create<mlir::Stencil::DoOp>(stageBuilder.getUnknownLoc(),
+			  stageBuilder.getStringAttr(lower), stageBuilder.getI64IntegerAttr(interval.LowerOffset),
+			  stageBuilder.getStringAttr(upper), stageBuilder.getI64IntegerAttr(interval.UpperOffset));
+		  mlirDo.body().push_back(new mlir::Block());
+		  mlir::OpBuilder doBuilder(mlirDo.body());
+
+		  mlirDo.setAttr("id", doBuilder.getI64IntegerAttr(domethod->getID()));
+
           // adding it's children
           for(const auto& stmtaccesspair : domethod->getChildren()) {
             auto protoStmtAccessPair = protoDoMethod->add_stmtaccesspairs();
-            serializeStmtAccessPair(protoStmtAccessPair, stmtaccesspair);
+            serializeStmtAccessPair(protoStmtAccessPair, stmtaccesspair, doBuilder, idsToArguments,
+				metadata);
           }
+
+          doBuilder.create<mlir::Stencil::TerminatorOp>(doBuilder.getUnknownLoc());
         }
+
+        stageBuilder.create<mlir::Stencil::TerminatorOp>(stageBuilder.getUnknownLoc());
       }
+
+      multiStageBuilder.create<mlir::Stencil::TerminatorOp>(multiStageBuilder.getUnknownLoc());
     }
+
+    builder.create<mlir::ReturnOp>(builder.getUnknownLoc());
+    module.push_back(mlirStencil);
   }
 
   // Filling Field: repeated StencilDescStatement stencilDescStatements = 10;
@@ -428,6 +571,11 @@ void IIRSerializer::serializeIIR(proto::iir::StencilInstantiation& target,
     DAWN_ASSERT_MSG(!stencilDescStmt->StackTrace,
                     "there should be no stack trace if inlining worked");
   }
+
+  std::error_code ec;
+  llvm::raw_fd_ostream ss("out.mlir", ec);
+  module.print(ss);
+  ss.flush();
 }
 
 std::string
@@ -469,7 +617,7 @@ IIRSerializer::serializeImpl(const std::shared_ptr<iir::StencilInstantiation>& i
   using namespace dawn::proto::iir;
   proto::iir::StencilInstantiation protoStencilInstantiation;
   serializeMetaData(protoStencilInstantiation, instantiation->getMetaData());
-  serializeIIR(protoStencilInstantiation, instantiation->getIIR());
+  serializeIIR(protoStencilInstantiation, instantiation->getIIR(), instantiation->getMetaData());
   protoStencilInstantiation.set_filename(instantiation->getMetaData().fileName_);
 
   // Encode the message
@@ -689,6 +837,150 @@ void IIRSerializer::deserializeIIR(std::shared_ptr<iir::StencilInstantiation>& t
   }
 }
 
+void IIRSerializer::deserializeIIR(std::shared_ptr<iir::StencilInstantiation>& target,
+								   mlir::Module module) {
+	int stencilPos = 0;
+	for(mlir::Function func : module.getFunctions()) {
+		int mssPos = 0;
+		sir::Attr attributes;
+		int64_t stencilID = func.getAttrOfType<mlir::IntegerAttr>("stencil.id").getInt();
+		target->getIIR()->insertChild(
+			make_unique<iir::Stencil>(target->getMetaData(), attributes, stencilID),
+									  target->getIIR());
+		const auto& IIRStencil = target->getIIR()->getChild(stencilPos++);
+
+		if(func.getAttrOfType<mlir::UnitAttr>("stencil.merge_do_methods")) {
+			IIRStencil->getStencilAttributes().set(sir::Attr::AK_MergeDoMethods);
+		}
+		if(func.getAttrOfType<mlir::UnitAttr>("stencil.merge_stages")) {
+			IIRStencil->getStencilAttributes().set(sir::Attr::AK_MergeStages);
+		}
+		if(func.getAttrOfType<mlir::UnitAttr>("stencil.merge_temporaries")) {
+			IIRStencil->getStencilAttributes().set(sir::Attr::AK_MergeTemporaries);
+		}
+		if(func.getAttrOfType<mlir::UnitAttr>("stencil.no_codegen")) {
+			IIRStencil->getStencilAttributes().set(sir::Attr::AK_NoCodeGen);
+		}
+		if(func.getAttrOfType<mlir::UnitAttr>("stencil.use_kcaches")) {
+			IIRStencil->getStencilAttributes().set(sir::Attr::AK_UseKCaches);
+		}
+
+		assert(func.getBlocks().size() == 1 && "expected only one block");
+		for(auto &op : func.front()) {
+			if(op.isKnownTerminator())
+				break;
+			mlir::Stencil::MultiStageOp multiStage = llvm::dyn_cast<mlir::Stencil::MultiStageOp>(op);
+			if(!multiStage)
+				continue;
+
+			int stagePos = 0;
+
+			iir::LoopOrderKind loopOrderKind;
+			llvm::StringRef loopOrder = multiStage.loop_order();
+			if(loopOrder == "Forward") {
+				loopOrderKind = iir::LoopOrderKind::LK_Forward;
+			} else if(loopOrder == "Backward") {
+				loopOrderKind = iir::LoopOrderKind::LK_Backward;
+			} else if(loopOrder == "Parallel") {
+				loopOrderKind = iir::LoopOrderKind::LK_Parallel;
+			} else {
+				dawn_unreachable("Unknown loop order");
+			}
+			IIRStencil->insertChild(make_unique<iir::MultiStage>(target->getMetaData(), loopOrderKind));
+
+			const auto& IIRMSS = IIRStencil->getChild(mssPos++);
+			int64_t multiStageID = multiStage.getAttrOfType<mlir::IntegerAttr>("id").getInt();
+			IIRMSS->setID(multiStageID);
+
+			for(auto &msop : multiStage.body().front()) {
+				if(msop.isKnownTerminator())
+					break;
+				mlir::Stencil::StageOp stage = llvm::cast<mlir::Stencil::StageOp>(msop);
+				assert(stage && "unexpected operation");
+
+				int doMethodPos = 0;
+				int stageID = stage.getAttrOfType<mlir::IntegerAttr>("id").getInt();
+
+				IIRMSS->insertChild(make_unique<iir::Stage>(target->getMetaData(), stageID));
+				const auto& IIRStage = IIRMSS->getChild(stagePos++);
+
+				for(auto &sop : stage.body().front()) {
+					if(sop.isKnownTerminator())
+						break;
+					mlir::Stencil::DoOp doMethod = llvm::cast<mlir::Stencil::DoOp>(sop);
+					assert(doMethod && "unexpected operation");
+
+					llvm::StringRef lower = doMethod.lower();
+					llvm::StringRef upper = doMethod.upper();
+					int64_t lowerOffset = doMethod.lower_offset().getSExtValue();
+					int64_t upperOffset = doMethod.upper_offset().getSExtValue();
+
+					int64_t lowerBound = lower == "kstart" ? 0 : lower == "kend" ? (1 << 20) : -1;
+					assert(lowerBound >= 0 && "unknown lower bound");
+					int64_t upperBound = upper == "kstart" ? 0 : upper == "kend" ? (1 << 20) : -1;
+					assert(upperBound >= 0 && "unknown upper bound");
+
+					IIRStage->insertChild(make_unique<iir::DoMethod>(
+						iir::Interval(lowerBound, upperBound, lowerOffset, upperOffset), target->getMetaData()));
+
+					auto& IIRDoMethod = IIRStage->getChild(doMethodPos++);
+					int64_t doMethodId = doMethod.getAttrOfType<mlir::IntegerAttr>("id").getInt();
+					IIRDoMethod->setID(doMethodId);
+
+					for(auto &dop : doMethod.body().front()) {
+						if(dop.isKnownTerminator())
+							break;
+						mlir::Stencil::StmtAccessPairOp stmtAccessPair =
+						llvm::dyn_cast<mlir::Stencil::StmtAccessPairOp>(dop);
+						assert(stmtAccessPair && "unexpected operation");
+
+						auto stmt = makeStmt(stmtAccessPair);
+						auto statement = std::make_shared<Statement>(stmt, nullptr);
+
+						std::shared_ptr<iir::Accesses> callerAccesses = std::make_shared<iir::Accesses>();
+
+						mlir::ArrayAttr writeAccesses = stmtAccessPair.getAttrOfType<mlir::ArrayAttr>("write_accesses");
+						for(auto writeAccess : writeAccesses) {
+							llvm::ArrayRef<mlir::Attribute> values = writeAccess.cast<mlir::ArrayAttr>().getValue();
+							int64_t fieldID = values[0].cast<mlir::IntegerAttr>().getInt();
+
+							int64_t iMinus = values[1].cast<mlir::IntegerAttr>().getInt();
+							int64_t iPlus = values[2].cast<mlir::IntegerAttr>().getInt();
+							int64_t jMinus = values[3].cast<mlir::IntegerAttr>().getInt();
+							int64_t jPlus = values[4].cast<mlir::IntegerAttr>().getInt();
+							int64_t kMinus = values[5].cast<mlir::IntegerAttr>().getInt();
+							int64_t kPlus = values[6].cast<mlir::IntegerAttr>().getInt();
+
+							callerAccesses->addWriteExtent(fieldID,
+														   iir::Extents(iMinus, iPlus, jMinus, jPlus, kMinus, kPlus));
+						}
+
+						mlir::ArrayAttr readAccesses = stmtAccessPair.getAttrOfType<mlir::ArrayAttr>("read_accesses");
+						for(auto readAccess : readAccesses) {
+							llvm::ArrayRef<mlir::Attribute> values = readAccess.cast<mlir::ArrayAttr>().getValue();
+							int64_t fieldID = values[0].cast<mlir::IntegerAttr>().getInt();
+
+							int64_t iMinus = values[1].cast<mlir::IntegerAttr>().getInt();
+							int64_t iPlus = values[2].cast<mlir::IntegerAttr>().getInt();
+							int64_t jMinus = values[3].cast<mlir::IntegerAttr>().getInt();
+							int64_t jPlus = values[4].cast<mlir::IntegerAttr>().getInt();
+							int64_t kMinus = values[5].cast<mlir::IntegerAttr>().getInt();
+							int64_t kPlus = values[6].cast<mlir::IntegerAttr>().getInt();
+
+							callerAccesses->addReadExtent(fieldID,
+														iir::Extents(iMinus, iPlus, jMinus, jPlus, kMinus, kPlus));
+						}
+
+						auto insertee = make_unique<iir::StatementAccessesPair>(statement);
+						insertee->setCallerAccesses(callerAccesses);
+						IIRDoMethod->insertChild(std::move(insertee));
+					}
+				}
+			}
+		}
+	}
+}
+
 void IIRSerializer::deserializeImpl(const std::string& str, IIRSerializer::SerializationKind kind,
                                     std::shared_ptr<iir::StencilInstantiation>& target) {
   GOOGLE_PROTOBUF_VERIFY_VERSION;
@@ -706,6 +998,19 @@ void IIRSerializer::deserializeImpl(const std::string& str, IIRSerializer::Seria
     if(!protoStencilInstantiation.ParseFromString(str))
       throw std::runtime_error(dawn::format("cannot deserialize StencilInstantiation: %s"));
     break;
+  }
+  case dawn::IIRSerializer::SK_MLIR: {
+	  llvm::SourceMgr sourceMgr;
+	  mlir::MLIRContext context;
+	  mlir::OwningModuleRef module;
+	  auto buffer = llvm::MemoryBuffer::getMemBuffer(str);
+	  sourceMgr.AddNewSourceBuffer(std::move(buffer), llvm::SMLoc());
+	  module = mlir::OwningModuleRef(mlir::parseSourceFile(sourceMgr, &context));
+	  std::shared_ptr<iir::StencilInstantiation> instantiation =
+		std::make_shared<iir::StencilInstantiation>(target->getOptimizerContext());
+	  deserializeIIR(instantiation, *module);
+	  target = instantiation;
+	  return;
   }
   default:
     dawn_unreachable("invalid SerializationKind");
@@ -764,3 +1069,4 @@ std::string dawn::IIRSerializer::serializeToString(
 }
 
 } // namespace dawn
+

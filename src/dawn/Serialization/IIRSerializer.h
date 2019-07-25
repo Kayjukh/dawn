@@ -21,6 +21,8 @@
 #include <memory>
 #include <string>
 
+#include "mlir/IR/Module.h"
+
 namespace dawn {
 
 struct SIR;
@@ -36,7 +38,8 @@ public:
   /// @brief Type of serialization algorithm to use
   enum SerializationKind {
     SK_Json, ///< JSON serialization
-    SK_Byte  ///< Protobuf's internal byte format
+    SK_Byte, ///< Protobuf's internal byte format
+    SK_MLIR, ///< MLIR file
   };
 
   /// @brief Deserialize the StencilInstantiaion from `file`
@@ -95,6 +98,8 @@ private:
   /// @param protoIIR   the serialized protobuf version of the IIR
   static void deserializeIIR(std::shared_ptr<iir::StencilInstantiation>& target,
                              const proto::iir::IIR& protoIIR);
+  static void deserializeIIR(std::shared_ptr<iir::StencilInstantiation>& target,
+							 mlir::Module module);
 
   /// \brief deserializeMetaData deserializes all the required Metadata
   /// \param target         the StencilInstantiation to insert the metadata into
@@ -114,7 +119,8 @@ private:
   /// @param target     The protobuf version of the StencilInstantiation to serilaize the IIR into
   /// @param iir        The IIR to serialize
   static void serializeIIR(proto::iir::StencilInstantiation& target,
-                           const std::unique_ptr<iir::IIR>& iir);
+                           const std::unique_ptr<iir::IIR>& iir,
+						   const iir::StencilMetaInformation& metadata);
   ///
   /// @brief serializeMetaData serializes the Metadata
   /// @param target    The protobuf version of the StencilInstantiation to serilaize the metadata to

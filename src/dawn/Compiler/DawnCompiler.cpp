@@ -206,6 +206,9 @@ std::unique_ptr<OptimizerContext> DawnCompiler::runOptimizer(std::shared_ptr<SIR
                    << "`";
 
     if(options_->SerializeIIR) {
+		auto deserializedInstance = IIRSerializer::deserialize("in.mlir", optimizer.get(), IIRSerializer::SK_MLIR);
+		deserializedInstance->dump();
+		IIRSerializer::serialize("out.iir", deserializedInstance, serializationKind);
       IIRSerializer::serialize(
           remove_fileextension(instantiation->getMetaData().getFileName(), ".cpp") + ".iir",
           instantiation, serializationKind);

@@ -19,6 +19,15 @@
 #include <tuple>
 #include <utility>
 
+#include "mlir/AffineOps/AffineOps.h"
+#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/Module.h"
+#include "mlir/IR/StandardTypes.h"
+#include "mlir/StandardOps/Ops.h"
+#include "mlir/Stencil/StencilOps.h"
+#include "mlir/Stencil/StencilTypes.h"
+
 using namespace dawn;
 
 void setAST(dawn::proto::statements::AST* astProto, const AST* ast);
@@ -72,6 +81,55 @@ void setField(dawn::proto::statements::Field* fieldProto, const sir::Field* fiel
   }
   setLocation(fieldProto->mutable_loc(), field->Loc);
 }
+
+//===------------------------------------------------------------------------------------------===//
+// MLIR serialization
+//===------------------------------------------------------------------------------------------===//
+
+MLIRStmtBuilder::MLIRStmtBuilder(mlir::OpBuilder& builder, const std::map<int, int> &idsToValues,
+								 const iir::StencilMetaInformation &metadata) :
+	dawn::ASTVisitorPostOrder(), builder(builder), idsToValues(idsToValues), metadata(metadata)
+{
+}
+
+std::shared_ptr<Stmt> MLIRStmtBuilder::postVisitNode(std::shared_ptr<ExprStmt> const& stmt) {
+	return stmt;
+}
+
+std::shared_ptr<Expr> MLIRStmtBuilder::visitAndReplace(std::shared_ptr<AssignmentExpr> const& node) {
+	auto s = node->getRight();
+	auto repl = s->acceptAndReplace(*this);
+
+	return postVisitNode(node);
+}
+
+std::shared_ptr<Expr> MLIRStmtBuilder::postVisitNode(std::shared_ptr<AssignmentExpr> const& expr) {
+	auto lhs = expr->getLeft();
+	int fieldID = metadata.getAccessIDFromExpr(lhs);
+	mlir::Function func = builder.getBlock()->getFunction();
+	mlir::Value *field = func.getArgument(idsToValues.at(fieldID));
+	builder.create<mlir::Stencil::WriteOp>(builder.getUnknownLoc(), field, exprToValues.at(expr->getRight()));
+
+	return expr;
+}
+
+std::shared_ptr<Expr> MLIRStmtBuilder::postVisitNode(std::shared_ptr<FieldAccessExpr> const& expr) {
+	auto currentOffset = expr->getOffset();
+	auto offsetOp = builder.create<mlir::Stencil::ConstantOffsetOp>(builder.getUnknownLoc(),
+		currentOffset[0], currentOffset[1], currentOffset[2]);
+	int fieldID = metadata.getAccessIDFromExpr(expr);
+	mlir::Function func = builder.getBlock()->getFunction();
+	mlir::Value *field = func.getArgument(idsToValues.at(fieldID));
+	mlir::Type fieldElementType = field->getType().cast<mlir::Stencil::StencilFieldType>().getElementType();
+	auto readOp = builder.create<mlir::Stencil::ReadOp>(builder.getUnknownLoc(), fieldElementType, field, offsetOp);
+	exprToValues[expr] = readOp;
+
+	return expr;
+}
+
+//===------------------------------------------------------------------------------------------===//
+// Protobuf serialization
+//===------------------------------------------------------------------------------------------===//
 
 ProtoStmtBuilder::ProtoStmtBuilder(dawn::proto::statements::Stmt* stmtProto) {
   currentStmtProto_.push(stmtProto);
@@ -709,6 +767,60 @@ std::shared_ptr<Stmt> makeStmt(const proto::statements::Stmt& statementProto) {
     dawn_unreachable("stmt not set");
   }
   return nullptr;
+}
+
+static unsigned int exprID = 1 << 20;
+
+std::shared_ptr<Expr> makeExpr(mlir::Value *value) {
+	mlir::Operation *definingOp = value->getDefiningOp();
+	if(auto readOp = llvm::dyn_cast<mlir::Stencil::ReadOp>(definingOp)) {
+		auto offsetOp = llvm::cast<mlir::Stencil::ConstantOffsetOp>(readOp.offset()->getDefiningOp());
+		int iOffset = offsetOp.i().getSExtValue();
+		int jOffset = offsetOp.j().getSExtValue();
+		int kOffset = offsetOp.k().getSExtValue();
+
+		Array3i offset{{iOffset, jOffset, kOffset}};
+		Array3i argumentOffset{{0, 0, 0}};
+		Array3i argumentMap{{-1, -1, -1}};
+
+		mlir::BlockArgument *field = llvm::cast<mlir::BlockArgument>(readOp.field());
+		llvm::StringRef fieldName = readOp.getOperation()->getFunction().getArgAttrOfType<mlir::StringAttr>(field->getArgNumber(), "stencil.name").getValue();
+
+		auto expr = std::make_shared<FieldAccessExpr>(fieldName, offset, argumentMap, argumentOffset,
+													  false, SourceLocation());
+		expr->setID(exprID++);
+		return expr;
+	}
+	return nullptr;
+}
+
+static std::shared_ptr<Expr> makeFieldAccess(mlir::Value *value) {
+	Array3i offset{{0, 0, 0}};
+	Array3i argumentOffset{{0, 0, 0}};
+	Array3i argumentMap{{-1, -1, -1}};
+
+	mlir::BlockArgument *field = llvm::cast<mlir::BlockArgument>(value);
+	llvm::StringRef fieldName = value->getFunction().getArgAttrOfType<mlir::StringAttr>(field->getArgNumber(), "stencil.name").getValue();
+
+	auto expr = std::make_shared<FieldAccessExpr>(fieldName, offset, argumentMap, argumentOffset,
+												  false, SourceLocation());
+	expr->setID(exprID++);
+	return expr;
+}
+
+std::shared_ptr<Stmt> makeStmt(mlir::Stencil::StmtAccessPairOp &stmtAccessPair) {
+	static unsigned int stmtID = 1 << 16;
+	for(auto &op : stmtAccessPair.body().front()) {
+		if(auto writeOp = llvm::dyn_cast<mlir::Stencil::WriteOp>(op)) {
+			mlir::Value *lhs = writeOp.field();
+			mlir::Value *rhs = writeOp.value();
+			auto expr =	std::make_shared<AssignmentExpr>(makeFieldAccess(lhs), makeExpr(rhs));
+			auto stmt = std::make_shared<ExprStmt>(expr, SourceLocation());
+			stmt->setID(stmtID++);
+			return stmt;
+		}
+	}
+	return nullptr;
 }
 
 std::shared_ptr<AST> makeAST(const dawn::proto::statements::AST& astProto) {

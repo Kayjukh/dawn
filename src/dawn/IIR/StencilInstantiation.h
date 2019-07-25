@@ -48,6 +48,8 @@ public:
   /// @brief Assemble StencilInstantiation for stencil
   StencilInstantiation(dawn::OptimizerContext* context);
 
+  void dump() const;
+
   StencilMetaInformation& getMetaData();
   const StencilMetaInformation& getMetaData() const { return metadata_; }
 

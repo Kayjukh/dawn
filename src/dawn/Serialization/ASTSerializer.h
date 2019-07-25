@@ -22,6 +22,10 @@
 #include "dawn/SIR/statements.pb.h"
 #include <stack>
 
+#include "mlir/IR/Builders.h"
+#include "mlir/Stencil/StencilOps.h"
+#include "mlir/Stencil/StencilTypes.h"
+
 using namespace dawn;
 
 void setAST(dawn::proto::statements::AST* astProto, const AST* ast);
@@ -92,6 +96,46 @@ public:
 void setAST(proto::statements::AST* astProto, const AST* ast);
 
 //===------------------------------------------------------------------------------------------===//
+// MLIR serialization
+//===------------------------------------------------------------------------------------------===//
+
+class MLIRStmtBuilder : public dawn::ASTVisitorPostOrder {
+	mlir::OpBuilder &builder;
+	const std::map<int, int> &idsToValues;
+	const iir::StencilMetaInformation &metadata;
+	std::map<std::shared_ptr<Expr>, mlir::Value*> exprToValues;
+
+public:
+	MLIRStmtBuilder(mlir::OpBuilder &builder, const std::map<int, int> &idsToValues,
+					const iir::StencilMetaInformation &metadata);
+
+	/*std::shared_ptr<Stmt> postVisitNode(std::shared_ptr<BlockStmt> const& stmt) override;
+	std::shared_ptr<Stmt> postVisitNode(std::shared_ptr<ReturnStmt> const& stmt) override;
+	std::shared_ptr<Stmt> postVisitNode(std::shared_ptr<VarDeclStmt> const& stmt) override;
+	std::shared_ptr<Stmt> postVisitNode(std::shared_ptr<VerticalRegionDeclStmt> const& stmt) override;
+	std::shared_ptr<Stmt> postVisitNode(std::shared_ptr<StencilCallDeclStmt> const& stmt) override;
+	std::shared_ptr<Stmt>
+	postVisitNode(std::shared_ptr<BoundaryConditionDeclStmt> const& stmt) override;
+	std::shared_ptr<Stmt> postVisitNode(std::shared_ptr<IfStmt> const& stmt) override;
+
+	std::shared_ptr<Expr> postVisitNode(std::shared_ptr<NOPExpr> const& expr) override;
+	std::shared_ptr<Expr> postVisitNode(std::shared_ptr<UnaryOperator> const& expr) override;
+	std::shared_ptr<Expr> postVisitNode(std::shared_ptr<BinaryOperator> const& expr) override;
+	std::shared_ptr<Expr> postVisitNode(std::shared_ptr<TernaryOperator> const& expr) override;
+	std::shared_ptr<Expr> postVisitNode(std::shared_ptr<FunCallExpr> const& expr) override;
+	std::shared_ptr<Expr> postVisitNode(std::shared_ptr<StencilFunCallExpr> const& expr) override;
+	std::shared_ptr<Expr> postVisitNode(std::shared_ptr<StencilFunArgExpr> const& expr) override;
+	std::shared_ptr<Expr> postVisitNode(std::shared_ptr<VarAccessExpr> const& expr) override;
+	std::shared_ptr<Expr> postVisitNode(std::shared_ptr<LiteralAccessExpr> const& expr) override;*/
+
+	std::shared_ptr<Stmt> postVisitNode(std::shared_ptr<ExprStmt> const& stmt) override;
+	std::shared_ptr<Expr> postVisitNode(std::shared_ptr<AssignmentExpr> const& expr) override;
+	std::shared_ptr<Expr> postVisitNode(std::shared_ptr<FieldAccessExpr> const& expr) override;
+
+	std::shared_ptr<Expr> visitAndReplace(std::shared_ptr<AssignmentExpr> const& node) override;
+};
+
+//===------------------------------------------------------------------------------------------===//
 // Deserialization
 //===------------------------------------------------------------------------------------------===//
 
@@ -112,8 +156,10 @@ std::shared_ptr<sir::Offset> makeOffset(const proto::statements::Offset& offsetP
 std::shared_ptr<sir::Interval> makeInterval(const proto::statements::Interval& intervalProto);
 
 std::shared_ptr<Expr> makeExpr(const proto::statements::Expr& expressionProto);
+std::shared_ptr<Expr> makeExpr(mlir::Value *value);
 
 std::shared_ptr<Stmt> makeStmt(const proto::statements::Stmt& statementProto);
+std::shared_ptr<Stmt> makeStmt(mlir::Stencil::StmtAccessPairOp &stmtAccessPair);
 
 std::shared_ptr<AST> makeAST(const dawn::proto::statements::AST& astProto);
 

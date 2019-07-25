@@ -1,13 +1,13 @@
 ##===------------------------------------------------------------------------------*- CMake -*-===##
-##                          _                      
-##                         | |                     
-##                       __| | __ ___      ___ ___  
-##                      / _` |/ _` \ \ /\ / / '_  | 
+##                          _
+##                         | |
+##                       __| | __ ___      ___ ___
+##                      / _` |/ _` \ \ /\ / / '_  |
 ##                     | (_| | (_| |\ V  V /| | | |
 ##                      \__,_|\__,_| \_/\_/ |_| |_| - Compiler Toolchain
 ##
 ##
-##  This file is distributed under the MIT License (MIT). 
+##  This file is distributed under the MIT License (MIT).
 ##  See LICENSE.txt for details.
 ##
 ##===------------------------------------------------------------------------------------------===##
@@ -25,6 +25,8 @@ yoda_add_library(
           Options.inc
   OBJECT
 )
+
+target_include_directories(DawnCompilerObjects PUBLIC /mnt/iir-gtclang/prefix/include)
 
 target_include_directories(DawnCompilerObjects PUBLIC $<TARGET_PROPERTY:DawnSIRStatic,INCLUDE_DIRECTORIES>)
 
